@@ -13,6 +13,7 @@ import requests
 import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, callback, dcc, html
+import plotly.io as pio
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -41,6 +42,13 @@ CHAT_LOG_PATH = STORAGE_DIR / "ollama_chat_history.jsonl"
 
 MAX_MESSAGES = int(os.getenv("OLLAMA_MAX_MESSAGES", "12"))
 MAX_LOG_ENTRIES = int(os.getenv("OLLAMA_MAX_LOG_ENTRIES", "500"))
+
+
+def configure_json_engine() -> None:
+    try:
+        pio.json.config.default_engine = "json"
+    except Exception:
+        pass
 
 
 def setup_tracing() -> None:
@@ -93,6 +101,10 @@ def fetch_models() -> list[str]:
         return [DEFAULT_MODEL]
 
 
+INITIAL_MODELS = fetch_models()
+INITIAL_MODEL = INITIAL_MODELS[0] if INITIAL_MODELS else DEFAULT_MODEL
+
+
 def ollama_health() -> bool:
     try:
         response = requests.get(OLLAMA_TAGS_URL, timeout=2)
@@ -103,8 +115,9 @@ def ollama_health() -> bool:
 
 def call_ollama(messages: list[dict[str, str]], model: str) -> tuple[str, float]:
     start = time.time()
+    timeout = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "300"))
     payload = {"model": model, "messages": messages, "stream": False}
-    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
+    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     content = data.get("message", {}).get("content", "<no response>")
@@ -112,6 +125,7 @@ def call_ollama(messages: list[dict[str, str]], model: str) -> tuple[str, float]
     return content, elapsed
 
 
+configure_json_engine()
 setup_tracing()
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
@@ -121,7 +135,7 @@ app.layout = dbc.Container(
     [
         dcc.Store(id="session-id", data=str(uuid.uuid4())),
         dcc.Store(id="conversation-store", data=[]),
-        dcc.Store(id="model-store", data=fetch_models()),
+        dcc.Store(id="model-store", data=INITIAL_MODELS),
         dcc.Interval(id="health-ticker", interval=3000, n_intervals=0),
         html.H2("Ollama Chat Console", className="mt-3"),
         dbc.Row(
@@ -149,9 +163,9 @@ app.layout = dbc.Container(
                                             id="model-select",
                                             options=[
                                                 {"label": model, "value": model}
-                                                for model in fetch_models()
+                                                for model in INITIAL_MODELS
                                             ],
-                                            value=DEFAULT_MODEL,
+                                            value=INITIAL_MODEL,
                                             clearable=False,
                                         ),
                                         dbc.Button(
@@ -180,7 +194,22 @@ app.layout = dbc.Container(
                             [
                                 dbc.CardHeader("Conversation"),
                                 dbc.CardBody(
-                                    html.Div(id="chat-window", style={"whiteSpace": "pre-wrap"})
+                                    dcc.Loading(
+                                        type="circle",
+                                        color="#00d4ff",
+                                        children=html.Div(
+                                            [
+                                                html.Div(
+                                                    id="chat-window",
+                                                    style={"whiteSpace": "pre-wrap"},
+                                                ),
+                                                html.Div(
+                                                    id="send-error",
+                                                    className="text-danger mt-2",
+                                                ),
+                                            ]
+                                        ),
+                                    )
                                 ),
                             ],
                             className="mb-3",
@@ -191,7 +220,6 @@ app.layout = dbc.Container(
                             style={"minHeight": "140px"},
                         ),
                         dbc.Button("Send", id="send-button", color="success", className="mt-2"),
-                        html.Div(id="send-error", className="text-danger mt-2"),
                     ],
                     width=8,
                 ),
@@ -240,10 +268,17 @@ def update_status(_ticks):
     prevent_initial_call=True,
 )
 def send_prompt(_n_clicks, prompt, conversation, model, session_id):
+    prompt = (prompt or "").strip()
     if not prompt:
         return conversation, _render_conversation(conversation), _render_history(), "", "Prompt is empty"
 
-    conversation = conversation or []
+    conversation = list(conversation or [])
+
+    selected_model = model
+    if not selected_model:
+        models = fetch_models()
+        selected_model = models[0] if models else DEFAULT_MODEL
+
     conversation.append({"role": "user", "content": prompt})
 
     error_message = ""
@@ -252,16 +287,20 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
 
     with tracer().start_as_current_span("ollama.chat") as span:
         span.set_attribute("openinference.project.name", PHOENIX_PROJECT_NAME)
-        span.set_attribute("ollama.model", model)
+        span.set_attribute("ollama.model", selected_model)
         span.set_attribute("ollama.prompt.length", len(prompt))
         span.set_attribute("ollama.session_id", session_id)
         try:
-            response_text, latency_ms = call_ollama(conversation, model)
+            response_text, latency_ms = call_ollama(conversation, selected_model)
             span.set_attribute("ollama.response.length", len(response_text))
             span.set_attribute("ollama.latency_ms", latency_ms)
             conversation.append({"role": "assistant", "content": response_text})
         except requests.RequestException as exc:
             error_message = f"Ollama request failed: {exc}"
+            span.record_exception(exc)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, error_message))
+        except Exception as exc:
+            error_message = f"Unexpected error: {exc}"
             span.record_exception(exc)
             span.set_status(trace.Status(trace.StatusCode.ERROR, error_message))
 
@@ -270,7 +309,7 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
             "id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "session_id": session_id,
-            "model": model,
+            "model": selected_model,
             "prompt": prompt,
             "response": response_text,
             "latency_ms": latency_ms,
@@ -280,7 +319,11 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
     conversation = conversation[-MAX_MESSAGES:]
     chat_view = _render_conversation(conversation)
     history_view = _render_history()
-    return conversation, chat_view, history_view, "", error_message
+    if error_message:
+        status_message = f"ERROR: {error_message}"
+    else:
+        status_message = f"OK: Reply received from {selected_model} in {latency_ms:.0f} ms"
+    return conversation, chat_view, history_view, "", status_message
 
 
 def _render_conversation(conversation):
