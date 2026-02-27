@@ -62,6 +62,60 @@ Set these in your environment or a `.env` file in the meta-repo root:
 | `PHOENIX_OTLP_ENDPOINT` | `http://127.0.0.1:6006/v1/traces` | Phoenix trace endpoint |
 | `OTEL_SERVICE_NAME` | `ollama-dash-chat` | OpenTelemetry service name |
 
+## Connection Strings
+
+Use these to connect to your running Ollama instance from code.
+
+### Local (same machine)
+
+| Service | URL |
+|---------|-----|
+| Ollama API | `http://127.0.0.1:11434` |
+| Chat UI | `http://127.0.0.1:11500` |
+| Phoenix Traces | `http://127.0.0.1:6006` |
+
+### Remote (other machines on your network)
+
+Replace `<YOUR_IP>` with the host machine's IP address.
+Find it with: `ipconfig getifaddr en0` (macOS) or `hostname -I` (Linux).
+
+| Service | URL |
+|---------|-----|
+| Ollama API | `http://<YOUR_IP>:11434` |
+| Chat UI | `http://<YOUR_IP>:11500` |
+| Phoenix Traces | `http://<YOUR_IP>:6006` |
+
+### Code Snippets
+
+**Python (requests):**
+```python
+import requests
+OLLAMA_URL = "http://127.0.0.1:11434"  # or http://<YOUR_IP>:11434
+
+response = requests.post(f"{OLLAMA_URL}/api/generate", json={
+    "model": "llama3.1",
+    "prompt": "Hello, world!",
+    "stream": False
+})
+print(response.json()["response"])
+```
+
+**Python (ollama library):**
+```python
+import ollama
+client = ollama.Client(host="http://127.0.0.1:11434")
+response = client.chat(model="llama3.1", messages=[
+    {"role": "user", "content": "Hello, world!"}
+])
+print(response["message"]["content"])
+```
+
+**curl:**
+```bash
+curl http://127.0.0.1:11434/api/generate \
+  -d '{"model": "llama3.1", "prompt": "Hello", "stream": false}'
+```
+
 ## Data Storage
 
 | Path | Contains | Gitignored |
