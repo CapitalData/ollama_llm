@@ -242,6 +242,16 @@ def refresh_models(_n_clicks):
     return options, models[0]
 
 
+def get_ollama_connection_display() -> str:
+    """Return Ollama connection info including tunnel address if configured."""
+    tunnel_host = os.getenv("OLLAMA_LLM_PROXY_HOST", "")
+    tunnel_port = int(os.getenv("OLLAMA_LLM_PROXY_REMOTE_PORT", "19053"))
+    
+    if tunnel_host:
+        return f"Internal: {OLLAMA_ENDPOINT} | External (tunnel): {tunnel_host}:{tunnel_port}"
+    return OLLAMA_ENDPOINT
+
+
 @callback(
     Output("ollama-status", "children"),
     Output("phoenix-status", "children"),
@@ -249,7 +259,8 @@ def refresh_models(_n_clicks):
 )
 def update_status(_ticks):
     ollama_ok = ollama_health()
-    ollama_text = "Ollama: online" if ollama_ok else "Ollama: offline"
+    ollama_conn = get_ollama_connection_display()
+    ollama_text = f"Ollama: {'online' if ollama_ok else 'offline'} ({ollama_conn})"
     phoenix_text = f"Phoenix OTLP: {PHOENIX_OTLP_ENDPOINT} | Project: {PHOENIX_PROJECT_NAME}"
     return ollama_text, phoenix_text
 

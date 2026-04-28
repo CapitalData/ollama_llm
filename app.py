@@ -102,6 +102,17 @@ def _handle_shutdown(signum: int, _frame) -> None:
     raise SystemExit(0)
 
 
+def _get_connection_info() -> str:
+    """Return connection address(es) for Ollama."""
+    local_addr = OLLAMA_ENDPOINT
+    tunnel_host = os.getenv("OLLAMA_LLM_PROXY_HOST", "")
+    tunnel_port = int(os.getenv("OLLAMA_LLM_PROXY_REMOTE_PORT", "19053"))
+    
+    if tunnel_host:
+        return f"Local: {local_addr} | External (via tunnel): {tunnel_host}:{tunnel_port}"
+    return local_addr
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
@@ -115,7 +126,7 @@ def main() -> int:
         _log("Ollama not detected; starting server")
         _start_ollama()
         if _wait_for_health():
-            _log(f"Ollama ready at {OLLAMA_ENDPOINT}")
+            _log(f"Ollama ready at {_get_connection_info()}")
         else:
             _log("Ollama did not pass health checks yet; will keep monitoring")
 
