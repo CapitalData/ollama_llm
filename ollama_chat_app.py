@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 import uuid
 from datetime import datetime
@@ -14,6 +15,8 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import Input, Output, State, callback, dcc, html
 import plotly.io as pio
+from flask import redirect, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -39,9 +42,115 @@ BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = Path(os.getenv("OLLAMA_STORAGE_DIR", str(BASE_DIR / "storage")))
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 CHAT_LOG_PATH = STORAGE_DIR / "ollama_chat_history.jsonl"
+SHARED_THREADS_PATH = STORAGE_DIR / "shared_threads.json"
+USERS_PATH = STORAGE_DIR / "users.json"
 
 MAX_MESSAGES = int(os.getenv("OLLAMA_MAX_MESSAGES", "12"))
 MAX_LOG_ENTRIES = int(os.getenv("OLLAMA_MAX_LOG_ENTRIES", "500"))
+SHARED_VIEW_REFRESH_MS = int(os.getenv("OLLAMA_SHARED_REFRESH_MS", "3000"))
+SESSION_SECRET = os.getenv(
+    "OLLAMA_CHAT_SECRET_KEY",
+    secrets.token_hex(32),
+)
+ALLOW_OPEN_REGISTRATION = os.getenv("OLLAMA_ALLOW_REGISTRATION", "1") not in ("0", "false", "False")
+
+
+def _load_users() -> dict[str, dict[str, Any]]:
+    if not USERS_PATH.exists():
+        return {}
+    try:
+        with USERS_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_users(data: dict[str, dict[str, Any]]) -> None:
+    with USERS_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def create_user(username: str, password: str) -> tuple[bool, str]:
+    username = (username or "").strip().lower()
+    if not username or not password:
+        return False, "Username and password are required."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    users = _load_users()
+    if username in users:
+        return False, "That username is already taken."
+    users[username] = {
+        "password_hash": generate_password_hash(password),
+        "created": datetime.utcnow().isoformat() + "Z",
+    }
+    _save_users(users)
+    return True, "Account created. You can now log in."
+
+
+def verify_user(username: str, password: str) -> bool:
+    username = (username or "").strip().lower()
+    users = _load_users()
+    record = users.get(username)
+    if not record:
+        return False
+    return check_password_hash(record.get("password_hash", ""), password or "")
+
+
+def _load_shared_threads() -> dict[str, dict[str, Any]]:
+    if not SHARED_THREADS_PATH.exists():
+        return {}
+    try:
+        with SHARED_THREADS_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_shared_threads(data: dict[str, dict[str, Any]]) -> None:
+    with SHARED_THREADS_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def is_thread_shared(session_id: str) -> bool:
+    return bool(_load_shared_threads().get(session_id, {}).get("enabled"))
+
+
+def get_thread_owner(session_id: str) -> str | None:
+    return _load_shared_threads().get(session_id, {}).get("owner")
+
+
+def set_thread_shared(session_id: str, enabled: bool, owner: str | None = None) -> None:
+    data = _load_shared_threads()
+    existing = data.get(session_id, {})
+    if enabled:
+        data[session_id] = {
+            "enabled": True,
+            "owner": owner or existing.get("owner"),
+            "created": existing.get("created", datetime.utcnow().isoformat() + "Z"),
+            "updated": datetime.utcnow().isoformat() + "Z",
+        }
+    else:
+        if session_id in data:
+            data[session_id]["enabled"] = False
+            data[session_id]["updated"] = datetime.utcnow().isoformat() + "Z"
+    _save_shared_threads(data)
+
+
+def load_thread_messages(session_id: str) -> list[dict[str, str]]:
+    """Reconstruct a conversation (user/assistant message list) from the history log."""
+    messages: list[dict[str, str]] = []
+    for entry in read_history():
+        if entry.get("session_id") != session_id:
+            continue
+        prompt = entry.get("prompt")
+        response = entry.get("response")
+        if prompt:
+            messages.append({"role": "user", "content": prompt})
+        if response:
+            messages.append({"role": "assistant", "content": response})
+    return messages
 
 
 def configure_json_engine() -> None:
@@ -131,13 +240,146 @@ setup_tracing()
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
 app.title = "Ollama Chat"
 
+server = app.server
+server.secret_key = SESSION_SECRET
+
+LOGIN_PATH = "/login"
+REGISTER_PATH = "/register"
+LOGOUT_PATH = "/logout"
+PUBLIC_PATHS = {LOGIN_PATH, REGISTER_PATH, LOGOUT_PATH}
+
+
+def _auth_page(title: str, body_html: str, message: str = "", message_color: str = "danger") -> str:
+    alert = (
+        f'<div class="alert alert-{message_color}" role="alert">{message}</div>'
+        if message
+        else ""
+    )
+    register_link = (
+        f'<p class="mt-3 text-center"><a href="{REGISTER_PATH}">Create an account</a></p>'
+        if ALLOW_OPEN_REGISTRATION
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><title>{title}</title>
+<link rel="stylesheet"
+ href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+<style>body{{background:#1a1a1a;color:#eee;padding-top:60px}}
+.card{{background:#222;border:1px solid #333}}</style>
+</head><body>
+<div class="container" style="max-width:420px">
+  <h3 class="text-center mb-3">{title}</h3>
+  <div class="card"><div class="card-body">
+    {alert}
+    {body_html}
+    {register_link if title == "Sign in" else ""}
+  </div></div>
+</div></body></html>"""
+
+
+def _login_form_html(next_url: str = "/") -> str:
+    return f"""<form method="post" action="{LOGIN_PATH}">
+  <input type="hidden" name="next" value="{next_url}">
+  <div class="mb-2"><label class="form-label">Username</label>
+    <input class="form-control" name="username" autofocus required></div>
+  <div class="mb-2"><label class="form-label">Password</label>
+    <input class="form-control" name="password" type="password" required></div>
+  <button class="btn btn-success w-100" type="submit">Sign in</button>
+</form>"""
+
+
+def _register_form_html() -> str:
+    return f"""<form method="post" action="{REGISTER_PATH}">
+  <div class="mb-2"><label class="form-label">Username</label>
+    <input class="form-control" name="username" autofocus required></div>
+  <div class="mb-2"><label class="form-label">Password</label>
+    <input class="form-control" name="password" type="password" required minlength="6"></div>
+  <button class="btn btn-primary w-100" type="submit">Create account</button>
+  <p class="mt-3 text-center"><a href="{LOGIN_PATH}">Back to sign in</a></p>
+</form>"""
+
+
+@server.route(LOGIN_PATH, methods=["GET", "POST"])
+def login_route():
+    next_url = request.values.get("next", "/")
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if verify_user(username, password):
+            session.clear()
+            session["username"] = username.strip().lower()
+            return redirect(next_url or "/")
+        return _auth_page("Sign in", _login_form_html(next_url), "Invalid credentials.")
+    return _auth_page("Sign in", _login_form_html(next_url))
+
+
+@server.route(REGISTER_PATH, methods=["GET", "POST"])
+def register_route():
+    if not ALLOW_OPEN_REGISTRATION:
+        return _auth_page(
+            "Registration disabled",
+            f'<p class="text-center"><a href="{LOGIN_PATH}">Back to sign in</a></p>',
+            "Open registration is disabled. Ask the administrator to create your account.",
+            message_color="warning",
+        )
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        ok, msg = create_user(username, password)
+        if ok:
+            return _auth_page("Sign in", _login_form_html("/"), msg, message_color="success")
+        return _auth_page("Create account", _register_form_html(), msg)
+    return _auth_page("Create account", _register_form_html())
+
+
+@server.route(LOGOUT_PATH)
+def logout_route():
+    session.clear()
+    return redirect(LOGIN_PATH)
+
+
+@server.before_request
+def require_login():
+    path = request.path or "/"
+    if path in PUBLIC_PATHS:
+        return None
+    # Allow static asset and Dash-internal routes only when logged in.
+    if "username" in session:
+        return None
+    # POST to Dash callback endpoint while unauthenticated -> 401 (so client gets a clean error).
+    if path.startswith("/_dash-"):
+        return ("Unauthorized", 401)
+    next_url = request.full_path if request.query_string else path
+    return redirect(f"{LOGIN_PATH}?next={next_url}")
+
+
+def current_username() -> str | None:
+    return session.get("username")
+
 app.layout = dbc.Container(
     [
+        dcc.Location(id="url", refresh=False),
         dcc.Store(id="session-id", data=str(uuid.uuid4())),
         dcc.Store(id="conversation-store", data=[]),
         dcc.Store(id="model-store", data=INITIAL_MODELS),
+        dcc.Store(id="view-mode", data="owner"),  # "owner" or "shared"
         dcc.Interval(id="health-ticker", interval=3000, n_intervals=0),
-        html.H2("Ollama Chat Console", className="mt-3"),
+        dcc.Interval(
+            id="shared-refresh-ticker",
+            interval=SHARED_VIEW_REFRESH_MS,
+            n_intervals=0,
+            disabled=True,
+        ),
+        dbc.Row(
+            [
+                dbc.Col(html.H2("Ollama Chat Console", className="mt-3"), width=9),
+                dbc.Col(
+                    html.Div(id="user-info", className="text-end mt-3"),
+                    width=3,
+                ),
+            ]
+        ),
         dbc.Row(
             [
                 dbc.Col(
@@ -181,6 +423,50 @@ app.layout = dbc.Container(
                         ),
                         dbc.Card(
                             [
+                                dbc.CardHeader("Share Thread"),
+                                dbc.CardBody(
+                                    [
+                                        dbc.Switch(
+                                            id="share-toggle",
+                                            label="Enable shareable link",
+                                            value=False,
+                                        ),
+                                        html.Div(
+                                            "Anyone with the link can view this thread "
+                                            "(read-only) and will see new messages as you "
+                                            "send them.",
+                                            className="text-muted small mt-1",
+                                        ),
+                                        dbc.InputGroup(
+                                            [
+                                                dbc.Input(
+                                                    id="share-url",
+                                                    value="",
+                                                    readonly=True,
+                                                    type="text",
+                                                ),
+                                                dcc.Clipboard(
+                                                    target_id="share-url",
+                                                    title="Copy link",
+                                                    style={
+                                                        "display": "inline-block",
+                                                        "fontSize": "1.2em",
+                                                        "marginLeft": "8px",
+                                                        "verticalAlign": "middle",
+                                                    },
+                                                ),
+                                            ],
+                                            className="mt-2",
+                                            id="share-url-group",
+                                            style={"display": "none"},
+                                        ),
+                                    ]
+                                ),
+                            ],
+                            className="mb-3",
+                        ),
+                        dbc.Card(
+                            [
                                 dbc.CardHeader("Recent Sessions"),
                                 dbc.CardBody(html.Div(id="recent-history")),
                             ]
@@ -199,6 +485,10 @@ app.layout = dbc.Container(
                                         color="#00d4ff",
                                         children=html.Div(
                                             [
+                                                html.Div(
+                                                    id="view-banner",
+                                                    className="mb-2",
+                                                ),
                                                 html.Div(
                                                     id="chat-window",
                                                     style={"whiteSpace": "pre-wrap"},
@@ -280,6 +570,21 @@ def update_status(_ticks):
 )
 def send_prompt(_n_clicks, prompt, conversation, model, session_id):
     prompt = (prompt or "").strip()
+    username = current_username()
+    if not username:
+        return conversation, _render_conversation(conversation), _render_history(), "", "You must be signed in."
+
+    # If thread is shared and has an owner, only the owner can post.
+    owner = get_thread_owner(session_id)
+    if owner and owner != username:
+        return (
+            conversation,
+            _render_conversation(conversation),
+            _render_history(),
+            prompt,
+            f"Read-only: only {owner} can post in this thread.",
+        )
+
     if not prompt:
         return conversation, _render_conversation(conversation), _render_history(), "", "Prompt is empty"
 
@@ -360,6 +665,139 @@ def _render_history():
         preview = entry.get("prompt", "")[:80]
         items.append(html.Div(f"{when} | {model} | {preview}"))
     return items
+
+
+def _parse_thread_from_search(search: str | None) -> str | None:
+    if not search:
+        return None
+    from urllib.parse import parse_qs
+
+    qs = parse_qs(search.lstrip("?"))
+    values = qs.get("thread")
+    return values[0] if values else None
+
+
+@callback(
+    Output("session-id", "data"),
+    Output("view-mode", "data"),
+    Output("conversation-store", "data", allow_duplicate=True),
+    Output("share-toggle", "value"),
+    Output("shared-refresh-ticker", "disabled"),
+    Output("view-banner", "children"),
+    Input("url", "search"),
+    State("session-id", "data"),
+    prevent_initial_call="initial_duplicate",
+)
+def handle_url(search, current_session_id):
+    thread_id = _parse_thread_from_search(search)
+    if not thread_id:
+        return (
+            current_session_id,
+            "owner",
+            dash.no_update,
+            is_thread_shared(current_session_id),
+            True,
+            "",
+        )
+
+    if not is_thread_shared(thread_id):
+        banner = dbc.Alert(
+            "This shared thread is not available (sharing disabled or never enabled).",
+            color="warning",
+        )
+        return current_session_id, "shared", [], False, True, banner
+
+    messages = load_thread_messages(thread_id)
+    banner = dbc.Alert(
+        "Viewing shared thread (read-only). Updates appear automatically.",
+        color="info",
+    )
+    return thread_id, "shared", messages, True, False, banner
+
+
+@callback(
+    Output("share-url", "value"),
+    Output("share-url-group", "style"),
+    Input("share-toggle", "value"),
+    Input("session-id", "data"),
+    State("url", "href"),
+    State("view-mode", "data"),
+)
+def toggle_share(enabled, session_id, href, view_mode):
+    # Don't allow viewers to re-share a thread they're viewing read-only.
+    if view_mode == "shared":
+        if enabled and href:
+            return href, {"display": "flex"}
+        return "", {"display": "none"}
+
+    username = current_username()
+    if not username:
+        return "", {"display": "none"}
+
+    # Only the owner (or a thread with no owner yet) can enable/disable sharing.
+    existing_owner = get_thread_owner(session_id)
+    if existing_owner and existing_owner != username:
+        return "", {"display": "none"}
+
+    set_thread_shared(session_id, bool(enabled), owner=username)
+    if not enabled or not href:
+        return "", {"display": "none"}
+
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(href)
+    share_url = urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, "", f"thread={session_id}", "")
+    )
+    return share_url, {"display": "flex"}
+
+
+@callback(
+    Output("conversation-store", "data", allow_duplicate=True),
+    Output("chat-window", "children", allow_duplicate=True),
+    Input("shared-refresh-ticker", "n_intervals"),
+    State("session-id", "data"),
+    State("view-mode", "data"),
+    prevent_initial_call=True,
+)
+def refresh_shared_view(_n, session_id, view_mode):
+    if view_mode != "shared" or not session_id:
+        return dash.no_update, dash.no_update
+    if not is_thread_shared(session_id):
+        return [], dbc.Alert("Sharing has been disabled for this thread.", color="warning")
+    messages = load_thread_messages(session_id)
+    return messages, _render_conversation(messages)
+
+
+@callback(
+    Output("prompt-input", "disabled"),
+    Output("send-button", "disabled"),
+    Input("view-mode", "data"),
+    Input("session-id", "data"),
+)
+def lock_input_for_shared_view(view_mode, session_id):
+    username = current_username()
+    owner = get_thread_owner(session_id)
+    # Lock the input if: viewing a shared thread you don't own,
+    # OR not logged in.
+    locked = (not username) or (owner is not None and owner != username) or view_mode == "shared" and owner != username
+    return locked, locked
+
+
+@callback(
+    Output("user-info", "children"),
+    Input("session-id", "data"),  # any trigger; runs on load
+)
+def show_user_info(_session_id):
+    username = current_username()
+    if not username:
+        return ""
+    return html.Span(
+        [
+            f"Signed in as {username} \u00b7 ",
+            html.A("Sign out", href=LOGOUT_PATH, className="text-info"),
+        ]
+    )
 
 
 if __name__ == "__main__":
