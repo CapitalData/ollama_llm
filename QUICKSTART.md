@@ -23,6 +23,77 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
+## Model Management
+
+**Important:** Before using the chat app, you must install at least one model. The 404 error `{"error":"model 'model_name' not found"}` means the model isn't installed.
+
+### Required Models
+
+| Model | Size | Purpose |
+|-------|------|----------|
+| **llama3.1** | 4.9 GB | Default chat model (recommended) |
+| llama3.2:1b | 1.3 GB | Lightweight alternative for limited RAM |
+| mistral | 4.1 GB | Alternative general-purpose model |
+
+### Install Models
+
+**If `ollama` CLI is available:**
+```bash
+ollama pull llama3.1
+ollama pull mistral
+```
+
+**If `ollama` CLI is not in PATH (use API):**
+```bash
+# Install llama3.1 (default model)
+curl -X POST http://127.0.0.1:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3.1"}'
+
+# Or without streaming output:
+curl -X POST http://127.0.0.1:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3.1", "stream": false}'
+```
+
+**Note:** Large models (4-7 GB) can take several minutes to download depending on internet speed.
+
+### List Installed Models
+
+**CLI:**
+```bash
+ollama list
+```
+
+**API:**
+```bash
+curl -s http://127.0.0.1:11434/api/tags | python3 -m json.tool
+```
+
+### Test a Model
+
+```bash
+curl -X POST http://127.0.0.1:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3.1", "messages": [{"role": "user", "content": "Hello"}], "stream": false}'
+```
+
+Successful response returns status 200 with the model's reply. A 404 error means the model isn't installed.
+
+### Delete a Model
+
+**CLI:**
+```bash
+ollama rm llama3.1
+```
+
+**API:**
+```bash
+curl -X DELETE http://127.0.0.1:11434/api/delete \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3.1"}'
+```
+
 ## Run
 
 ### Ollama Server Wrapper
@@ -190,8 +261,23 @@ handle this automatically. See [meta-repo QUICKSTART](../QUICKSTART.md#7-lift-an
 ### "Connection refused" on chat UI
 Ollama server must be running first. Start it with `python app.py` or via the control panel.
 
-### Model not found
-Pull the model first: `ollama pull llama3.1`
+### "404 Client Error: Not Found" or "model 'xyz' not found"
+
+This means the model isn't installed in Ollama. Install it first:
+
+**With CLI:**
+```bash
+ollama pull llama3.1
+```
+
+**Without CLI (API method):**
+```bash
+curl -X POST http://127.0.0.1:11434/api/pull \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3.1"}'
+```
+
+See the **Model Management** section above for complete instructions and common models.
 
 ### Traces not appearing in Phoenix
 Verify `PHOENIX_OTLP_ENDPOINT` points to a running Phoenix instance (port 6006).
