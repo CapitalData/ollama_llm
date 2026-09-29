@@ -41,6 +41,7 @@ Environment variables:
 - `OLLAMA_ENDPOINT` - Ollama API endpoint (default: `http://127.0.0.1:11434`)
 - `OLLAMA_MODEL` - Default model (default: `llama3.1`)
 - `OLLAMA_MAX_MESSAGES` - Max context messages (default: `12`)
+- `OLLAMA_REQUEST_TIMEOUT_SECONDS` - Ollama connection/read timeout (default: `300`)
 - `OLLAMA_STORAGE_DIR` - Chat history storage (default: `./storage`)
 - `OLLAMA_SHARED_REFRESH_MS` - Poll interval for shared-thread viewers (default: `3000`)
 
@@ -126,7 +127,7 @@ enabled, and is the only account that can disable sharing or post new turns.
 
 - Multi-turn conversations with context management
 - Model selection from available Ollama models
-- Streaming responses
+- Streamed Ollama responses, collected before updating the chat view
 - OpenTelemetry span tracing for every chat interaction
 - Project-based trace tagging
 - Automatic chat history persistence

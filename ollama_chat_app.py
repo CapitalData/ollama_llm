@@ -225,11 +225,26 @@ def ollama_health() -> bool:
 def call_ollama(messages: list[dict[str, str]], model: str) -> tuple[str, float]:
     start = time.time()
     timeout = int(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "300"))
-    payload = {"model": model, "messages": messages, "stream": False}
-    response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    content = data.get("message", {}).get("content", "<no response>")
+    payload = {"model": model, "messages": messages, "stream": True}
+    chunks = []
+    with requests.post(
+        OLLAMA_CHAT_URL,
+        json=payload,
+        stream=True,
+        timeout=timeout,
+    ) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            if chunk.get("error"):
+                raise RuntimeError(chunk["error"])
+            message = chunk.get("message") or {}
+            chunks.append(message.get("content", ""))
+            if chunk.get("done"):
+                break
+    content = "".join(chunks) or "<no response>"
     elapsed = (time.time() - start) * 1000
     return content, elapsed
 
