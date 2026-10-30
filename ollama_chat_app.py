@@ -1,8 +1,10 @@
 """Dash chat frontend for Ollama with OpenTelemetry export to Arize Phoenix."""
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -47,6 +49,8 @@ SHARED_THREADS_PATH = STORAGE_DIR / "shared_threads.json"
 USERS_PATH = STORAGE_DIR / "users.json"
 PROJECT_MEMORY_DB_PATH = STORAGE_DIR / "project_memory.sqlite3"
 PROJECT_MEMORY_INITIALIZED = False
+LIBRARY_UPLOADS_DIR = STORAGE_DIR / "project_library"
+DEFAULT_PROJECT_NAME = os.getenv("OLLAMA_PROJECT_NAME", "default-project")
 
 MAX_MESSAGES = int(os.getenv("OLLAMA_MAX_MESSAGES", "12"))
 MAX_LOG_ENTRIES = int(os.getenv("OLLAMA_MAX_LOG_ENTRIES", "500"))
@@ -257,6 +261,36 @@ def initialize_project_memory() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS books (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(topic_id) REFERENCES topics(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS book_summaries (
+                id TEXT PRIMARY KEY,
+                book_id TEXT NOT NULL,
+                abstract TEXT,
+                toc_text TEXT,
+                index_text TEXT,
+                chapter_map_json TEXT,
+                page_count INTEGER,
+                extracted_at TEXT NOT NULL,
+                FOREIGN KEY(book_id) REFERENCES books(id)
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -460,6 +494,248 @@ def get_project_context(project_id: str, topic_id: str | None = None) -> dict[st
         }
     finally:
         conn.close()
+
+
+def _clean_retrieval_text(value: str | None) -> str:
+    text = (value or "").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_pdf_summary(pdf_path: str) -> dict[str, Any]:
+    """Extract a lightweight summary index from a PDF: title, abstract, TOC, and keywords."""
+    import fitz
+
+    pdf_file = Path(pdf_path)
+    if not pdf_file.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    doc = fitz.open(str(pdf_file))
+    try:
+        pages = []
+        for page in doc:
+            text = page.get_text("text", sort=True)
+            if text:
+                pages.append(text)
+        full_text = "\n".join(pages)
+        cleaned_text = _clean_retrieval_text(full_text)
+        metadata_title = (doc.metadata or {}).get("title") or ""
+        first_line = ""
+        if pages:
+            first_line = _clean_retrieval_text(pages[0].splitlines()[0]) if pages[0].splitlines() else ""
+        title = _clean_retrieval_text(metadata_title) or first_line or _clean_retrieval_text(full_text[:200])
+
+        abstract_match = re.search(
+            r"abstract\s*:?\s*(.*?)(?=\n\s*(?:keywords?|chapter|introduction|overview|background|contents?)\b|$)",
+            full_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        abstract = _clean_retrieval_text(abstract_match.group(1)) if abstract_match else _clean_retrieval_text(full_text[:800])
+
+        chapter_entries = doc.get_toc(simple=False)
+        toc_lines = []
+        for entry in chapter_entries:
+            if len(entry) >= 3:
+                toc_lines.append(f"{entry[1]} (p. {entry[2]})")
+        toc_text = "\n".join(toc_lines) or _clean_retrieval_text(full_text[:1200])
+
+        word_pattern = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", full_text)
+        stop_words = {
+            "this", "that", "with", "from", "into", "have", "will", "what", "when", "where",
+            "there", "their", "about", "over", "after", "before", "through", "under", "using",
+            "your", "they", "them", "then", "than", "been", "were", "more", "most", "also",
+            "chapter", "page", "pages", "book", "guide", "system", "systems", "local", "first",
+        }
+        counts: dict[str, int] = {}
+        for word in word_pattern:
+            token = word.lower()
+            if token in stop_words:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+        index_terms = [word for word, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:25]]
+        index_text = " ".join(index_terms) or _clean_retrieval_text(full_text[:500])
+
+        return {
+            "title": title[:200],
+            "abstract": abstract[:2000],
+            "toc_text": toc_text[:4000],
+            "index_text": index_text[:2000],
+            "page_count": len(doc),
+            "chapter_map": chapter_entries[:25],
+        }
+    finally:
+        doc.close()
+
+
+def index_pdf_into_project(project_id: str, topic_id: str, pdf_path: str, filename: str | None = None) -> dict[str, Any]:
+    """Extract PDF summary metadata and store it in the project library."""
+    initialize_project_memory()
+    summary = extract_pdf_summary(pdf_path)
+    source_path = str(Path(pdf_path).resolve())
+    book_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat() + "Z"
+    conn = _connect_project_memory_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO books(id, project_id, topic_id, title, filename, source_path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (book_id, project_id, topic_id, summary["title"], filename or Path(pdf_path).name, source_path, created_at),
+        )
+        summary_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO book_summaries(id, book_id, abstract, toc_text, index_text, chapter_map_json, page_count, extracted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                summary_id,
+                book_id,
+                summary["abstract"],
+                summary["toc_text"],
+                summary["index_text"],
+                json.dumps(summary["chapter_map"]),
+                summary["page_count"],
+                created_at,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT b.*, s.abstract, s.toc_text, s.index_text, s.chapter_map_json, s.page_count FROM books b JOIN book_summaries s ON b.id=s.book_id WHERE b.id=?",
+            (book_id,),
+        ).fetchone()
+        return {
+            "id": row["id"],
+            "project_id": row["project_id"],
+            "topic_id": row["topic_id"],
+            "title": row["title"],
+            "filename": row["filename"],
+            "source_path": row["source_path"],
+            "abstract": row["abstract"],
+            "toc_text": row["toc_text"],
+            "index_text": row["index_text"],
+            "chapter_map": json.loads(row["chapter_map_json"] or "[]"),
+            "page_count": row["page_count"],
+            "created_at": row["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def search_project_library(project_id: str, query: str, topic_id: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    """Search the summary metadata of all books in a project using a simple keyword match."""
+    if not query:
+        return []
+    initialize_project_memory()
+    conn = _connect_project_memory_db()
+    try:
+        clauses = []
+        params: list[str] = [project_id]
+        if topic_id is not None:
+            clauses.append("b.topic_id = ?")
+            params.append(topic_id)
+
+        sql = """
+            SELECT b.id as book_id, b.title, b.filename, b.source_path, b.project_id, b.topic_id,
+                   s.abstract, s.toc_text, s.index_text, s.page_count
+            FROM books b
+            JOIN book_summaries s ON b.id = s.book_id
+            WHERE b.project_id = ?
+        """
+        if clauses:
+            sql += " AND " + " AND ".join(clauses)
+        sql += " ORDER BY b.created_at DESC"
+
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        terms = re.findall(r"[a-zA-Z0-9_-]{3,}", query.lower())
+        if not terms:
+            return []
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            hay = " ".join([
+                row["title"],
+                row["abstract"] or "",
+                row["toc_text"] or "",
+                row["index_text"] or "",
+                row["filename"] or "",
+            ]).lower()
+            score = sum(1 for term in terms if term.lower() in hay)
+            if score > 0:
+                matches.append({
+                    "book_id": row["book_id"],
+                    "project_id": row["project_id"],
+                    "topic_id": row["topic_id"],
+                    "title": row["title"],
+                    "filename": row["filename"],
+                    "source_path": row["source_path"],
+                    "abstract": row["abstract"],
+                    "toc_text": row["toc_text"],
+                    "index_text": row["index_text"],
+                    "page_count": row["page_count"],
+                    "score": score,
+                })
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        return matches[:limit]
+    finally:
+        conn.close()
+
+
+def extract_relevant_pdf_pages(pdf_path: str, query: str, max_pages: int = 3) -> list[str]:
+    """Return the most relevant page excerpts from a matched PDF for the current query."""
+    if not query or not Path(pdf_path).exists():
+        return []
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        terms = re.findall(r"[a-zA-Z0-9_-]{2,}", query.lower())
+        if not terms:
+            return []
+        hits: list[tuple[int, int, str]] = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = _clean_retrieval_text(page.get_text("text", sort=True))
+            if not text:
+                continue
+            score = sum(1 for term in terms if term.lower() in text.lower())
+            if score > 0:
+                hits.append((score, page_num + 1, text[:1200]))
+        if not hits:
+            for page_num in range(min(max_pages, len(doc))):
+                text = _clean_retrieval_text(doc[page_num].get_text("text", sort=True))
+                excerpt = text[:1200] if text else ""
+                if excerpt:
+                    hits.append((0, page_num + 1, excerpt))
+        hits.sort(key=lambda item: item[0], reverse=True)
+        selected: list[str] = []
+        seen_pages: set[int] = set()
+        for _, page_no, text in hits[:max_pages]:
+            if page_no in seen_pages:
+                continue
+            seen_pages.add(page_no)
+            selected.append(f"[Page {page_no}] {text}")
+        return selected
+    finally:
+        doc.close()
+
+
+def build_library_context(project_id: str, topic_id: str | None, query: str, limit: int = 3) -> list[str]:
+    """Build compact book summary + page-excerpt context strings for the model prompt."""
+    matches = search_project_library(project_id, query, topic_id, limit=limit)
+    contexts: list[str] = []
+    for match in matches:
+        excerpt_lines = extract_relevant_pdf_pages(match["source_path"], query, max_pages=3)
+        chunks = [
+            f"Book: {match['title']}",
+            f"Abstract: {match['abstract'][:600]}",
+            f"TOC: {match['toc_text'][:600]}",
+            f"Index keywords: {match['index_text'][:300]}",
+        ]
+        if excerpt_lines:
+            chunks.append("Relevant page excerpts:\n" + "\n".join(excerpt_lines[:2]))
+        contexts.append("\n".join(chunks))
+    return contexts
 
 
 def fetch_models() -> list[str]:
@@ -745,6 +1021,37 @@ app.layout = dbc.Container(
                         ),
                         dbc.Card(
                             [
+                                dbc.CardHeader("Project Library"),
+                                dbc.CardBody(
+                                    [
+                                        dcc.Upload(
+                                            id="library-upload",
+                                            children=html.Div(
+                                                [
+                                                    "Drag & drop PDFs here",
+                                                    html.Br(),
+                                                    "or click to browse",
+                                                ],
+                                                className="text-center text-muted",
+                                            ),
+                                            multiple=True,
+                                            enable_folder_selection=True,
+                                            style={
+                                                "border": "1px dashed #7f8c8d",
+                                                "borderRadius": "8px",
+                                                "padding": "12px",
+                                                "textAlign": "center",
+                                            },
+                                        ),
+                                        html.Div(id="library-status", className="mt-2 small"),
+                                        html.Div(id="library-books", className="mt-2"),
+                                    ]
+                                ),
+                            ],
+                            className="mb-3",
+                        ),
+                        dbc.Card(
+                            [
                                 dbc.CardHeader("Recent Sessions"),
                                 dbc.CardBody(html.Div(id="recent-history")),
                             ]
@@ -814,10 +1121,47 @@ def get_ollama_connection_display() -> str:
     """Return Ollama connection info including tunnel address if configured."""
     tunnel_host = os.getenv("OLLAMA_LLM_PROXY_HOST", "")
     tunnel_port = int(os.getenv("OLLAMA_LLM_PROXY_REMOTE_PORT", "19053"))
-    
+
     if tunnel_host:
         return f"Internal: {OLLAMA_ENDPOINT} | External (tunnel): {tunnel_host}:{tunnel_port}"
     return OLLAMA_ENDPOINT
+
+
+@callback(
+    Output("library-status", "children"),
+    Output("library-books", "children"),
+    Input("library-upload", "contents"),
+    State("library-upload", "filename"),
+    prevent_initial_call=True,
+)
+def ingest_library_upload(contents, filenames):
+    if not contents:
+        return "No files uploaded.", ""
+    if not filenames:
+        return "Upload did not include any filenames.", ""
+
+    project = ensure_project(DEFAULT_PROJECT_NAME, "Default project library")
+    topic = project["topics"][0]
+    saved_books = []
+    LIBRARY_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for content, filename in zip(contents, filenames):
+        if not filename or not filename.lower().endswith(".pdf"):
+            continue
+        try:
+            data = content.split(",", 1)[1]
+            pdf_bytes = base64.b64decode(data)
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+            target_path = LIBRARY_UPLOADS_DIR / safe_name
+            target_path.write_bytes(pdf_bytes)
+            indexed = index_pdf_into_project(project["id"], topic["id"], str(target_path), safe_name)
+            saved_books.append(html.Div(f"{indexed['title']} — {indexed['page_count']} pages"))
+        except Exception as exc:  # pragma: no cover - UI safety path
+            saved_books.append(html.Div(f"Failed: {filename} — {exc}", className="text-danger"))
+
+    if not saved_books:
+        return "No valid PDF files were found in the upload.", ""
+    return f"Indexed {len(saved_books)} PDF(s).", saved_books
 
 
 @callback(
@@ -873,7 +1217,29 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
         models = fetch_models()
         selected_model = models[0] if models else DEFAULT_MODEL
 
-    conversation.append({"role": "user", "content": prompt})
+    project = ensure_project(DEFAULT_PROJECT_NAME, "Default project library")
+    topic = project["topics"][0]
+    cached_context = build_library_context(project["id"], topic["id"], prompt, limit=3)
+    memory_context = get_project_context(project["id"], topic["id"])
+    memory_lines = [
+        f"- {entry['text']}" for entry in memory_context.get("entries", [])[:5]
+    ]
+
+    instructions = [
+        "You are working in a local-first project memory system.",
+        "Use the project memory and any relevant library summaries to answer precisely.",
+        "Only cite the library if the summary indicates a relevant match.",
+    ]
+    if memory_lines:
+        instructions.append("Project memory:\n" + "\n".join(memory_lines))
+    if cached_context:
+        instructions.append("Relevant PDF summary context:\n" + "\n\n".join(cached_context))
+
+    model_messages = [
+        {"role": "system", "content": "\n".join(instructions)},
+        *conversation,
+        {"role": "user", "content": prompt},
+    ]
 
     error_message = ""
     response_text = ""
@@ -885,7 +1251,7 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
         span.set_attribute("ollama.prompt.length", len(prompt))
         span.set_attribute("ollama.session_id", session_id)
         try:
-            response_text, latency_ms = call_ollama(conversation, selected_model)
+            response_text, latency_ms = call_ollama(model_messages, selected_model)
             span.set_attribute("ollama.response.length", len(response_text))
             span.set_attribute("ollama.latency_ms", latency_ms)
             conversation.append({"role": "assistant", "content": response_text})
@@ -899,6 +1265,13 @@ def send_prompt(_n_clicks, prompt, conversation, model, session_id):
             span.set_status(trace.Status(trace.StatusCode.ERROR, error_message))
 
     if response_text:
+        save_memory_entry(
+            project_id=project["id"],
+            topic_id=topic["id"],
+            text=f"Q: {prompt}\nA: {response_text[:800]}",
+            source="chat",
+            kind="answer",
+        )
         entry = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat() + "Z",
