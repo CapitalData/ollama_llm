@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sqlite3
 import time
 import uuid
 from datetime import datetime
@@ -44,6 +45,8 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 CHAT_LOG_PATH = STORAGE_DIR / "ollama_chat_history.jsonl"
 SHARED_THREADS_PATH = STORAGE_DIR / "shared_threads.json"
 USERS_PATH = STORAGE_DIR / "users.json"
+PROJECT_MEMORY_DB_PATH = STORAGE_DIR / "project_memory.sqlite3"
+PROJECT_MEMORY_INITIALIZED = False
 
 MAX_MESSAGES = int(os.getenv("OLLAMA_MAX_MESSAGES", "12"))
 MAX_LOG_ENTRIES = int(os.getenv("OLLAMA_MAX_LOG_ENTRIES", "500"))
@@ -197,6 +200,266 @@ def read_history() -> list[dict[str, Any]]:
 def append_history(entry: dict[str, Any]) -> None:
     with CHAT_LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
+
+
+def _connect_project_memory_db() -> sqlite3.Connection:
+    """Open a SQLite connection to the local project memory DB."""
+    PROJECT_MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(PROJECT_MEMORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def initialize_project_memory() -> None:
+    """Create the project/topic/memory tables if they do not exist."""
+    global PROJECT_MEMORY_INITIALIZED
+    if PROJECT_MEMORY_INITIALIZED:
+        return
+    conn = _connect_project_memory_db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topics (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                summary TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_entries (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                topic_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                text TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id),
+                FOREIGN KEY(topic_id) REFERENCES topics(id)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    PROJECT_MEMORY_INITIALIZED = True
+
+
+def ensure_project(name: str, description: str = "") -> dict[str, Any]:
+    """Create or fetch a project and a default General topic."""
+    project_name = (name or "").strip()
+    if not project_name:
+        raise ValueError("Project name is required.")
+    initialize_project_memory()
+    project_id = f"project-{project_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
+    conn = _connect_project_memory_db()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM projects WHERE lower(name)=lower(?)",
+            (project_name,),
+        ).fetchone()
+        if existing is None:
+            project_id = f"project-{project_name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
+            created_at = datetime.utcnow().isoformat() + "Z"
+            conn.execute(
+                "INSERT INTO projects(id, name, description, created_at) VALUES (?, ?, ?, ?)",
+                (project_id, project_name, description, created_at),
+            )
+            topic_id = f"topic-{project_id}-{uuid.uuid4().hex[:8]}"
+            conn.execute(
+                "INSERT INTO topics(id, project_id, name, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (topic_id, project_id, "General", "", created_at, created_at),
+            )
+            conn.commit()
+            project_row = conn.execute(
+                "SELECT * FROM projects WHERE id=?",
+                (project_id,),
+            ).fetchone()
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id=?",
+                (topic_id,),
+            ).fetchone()
+            return {
+                "id": project_row["id"],
+                "name": project_row["name"],
+                "description": project_row["description"],
+                "created_at": project_row["created_at"],
+                "topics": [
+                    {
+                        "id": topic_row["id"],
+                        "project_id": topic_row["project_id"],
+                        "name": topic_row["name"],
+                        "summary": topic_row["summary"],
+                        "created_at": topic_row["created_at"],
+                        "updated_at": topic_row["updated_at"],
+                    }
+                ],
+            }
+
+        project_row = existing
+        topic_row = conn.execute(
+            "SELECT * FROM topics WHERE project_id=? ORDER BY created_at LIMIT 1",
+            (project_row["id"],),
+        ).fetchone()
+        if topic_row is None:
+            topic_id = f"topic-{project_row['id']}-{uuid.uuid4().hex[:8]}"
+            created_at = datetime.utcnow().isoformat() + "Z"
+            conn.execute(
+                "INSERT INTO topics(id, project_id, name, summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (topic_id, project_row["id"], "General", "", created_at, created_at),
+            )
+            conn.commit()
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id=?",
+                (topic_id,),
+            ).fetchone()
+        settings = {
+            "id": project_row["id"],
+            "name": project_row["name"],
+            "description": project_row["description"],
+            "created_at": project_row["created_at"],
+            "topics": [
+                {
+                    "id": topic_row["id"],
+                    "project_id": topic_row["project_id"],
+                    "name": topic_row["name"],
+                    "summary": topic_row["summary"],
+                    "created_at": topic_row["created_at"],
+                    "updated_at": topic_row["updated_at"],
+                }
+            ],
+        }
+        return settings
+    finally:
+        conn.close()
+
+
+def save_memory_entry(
+    project_id: str,
+    topic_id: str,
+    text: str,
+    source: str,
+    kind: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist a project/topic memory entry."""
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("Memory text cannot be empty.")
+    initialize_project_memory()
+    conn = _connect_project_memory_db()
+    try:
+        entry_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat() + "Z"
+        conn.execute(
+            """
+            INSERT INTO memory_entries(id, project_id, topic_id, kind, source, text, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (entry_id, project_id, topic_id, kind, source, body, json.dumps(metadata or {}, sort_keys=True), created_at),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_entries WHERE id=?",
+            (entry_id,),
+        ).fetchone()
+        return {
+            "id": row["id"],
+            "project_id": row["project_id"],
+            "topic_id": row["topic_id"],
+            "kind": row["kind"],
+            "source": row["source"],
+            "text": row["text"],
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "created_at": row["created_at"],
+        }
+    finally:
+        conn.close()
+
+
+def get_project_context(project_id: str, topic_id: str | None = None) -> dict[str, Any]:
+    """Return saved project/topic state and memory entries for a context window."""
+    initialize_project_memory()
+    conn = _connect_project_memory_db()
+    try:
+        project_row = conn.execute(
+            "SELECT * FROM projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
+        if project_row is None:
+            raise ValueError(f"Unknown project id: {project_id}")
+
+        if topic_id is None:
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE project_id=? ORDER BY created_at LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        else:
+            topic_row = conn.execute(
+                "SELECT * FROM topics WHERE id=? AND project_id=?",
+                (topic_id, project_id),
+            ).fetchone()
+        if topic_row is None:
+            raise ValueError(f"Unknown topic id for project: {project_id}")
+
+        rows = conn.execute(
+            """
+            SELECT * FROM memory_entries
+            WHERE project_id=? AND topic_id=?
+            ORDER BY created_at DESC
+            LIMIT 25
+            """,
+            (project_id, topic_row["id"]),
+        ).fetchall()
+        entries = []
+        for row in rows:
+            entries.append(
+                {
+                    "id": row["id"],
+                    "kind": row["kind"],
+                    "source": row["source"],
+                    "text": row["text"],
+                    "metadata": json.loads(row["metadata_json"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+            )
+        return {
+            "project": {
+                "id": project_row["id"],
+                "name": project_row["name"],
+                "description": project_row["description"],
+                "created_at": project_row["created_at"],
+            },
+            "topic": {
+                "id": topic_row["id"],
+                "project_id": topic_row["project_id"],
+                "name": topic_row["name"],
+                "summary": topic_row["summary"],
+                "created_at": topic_row["created_at"],
+                "updated_at": topic_row["updated_at"],
+            },
+            "entries": entries,
+        }
+    finally:
+        conn.close()
 
 
 def fetch_models() -> list[str]:

@@ -1,6 +1,8 @@
 import json
 
-from ollama_chat_app import call_ollama
+import pytest
+
+from ollama_chat_app import call_ollama, ensure_project, get_project_context, save_memory_entry
 
 
 class FakeResponse:
@@ -39,3 +41,29 @@ def test_call_ollama_collects_streamed_chat_chunks(monkeypatch):
     assert elapsed >= 0
     assert calls[0][1]["stream"] is True
     assert calls[0][2] is True
+
+
+def test_project_memory_storage_round_trip(tmp_path, monkeypatch):
+    db_path = tmp_path / "project_memory.sqlite3"
+    monkeypatch.setattr("ollama_chat_app.PROJECT_MEMORY_DB_PATH", db_path)
+    monkeypatch.setattr("ollama_chat_app.PROJECT_MEMORY_INITIALIZED", False)
+
+    project = ensure_project("alpha", "demo project")
+    topic = project["topics"][0]
+
+    saved = save_memory_entry(
+        project_id=project["id"],
+        topic_id=topic["id"],
+        text="Remember to keep the app local-first and document decisions.",
+        source="manual-note",
+        kind="note",
+    )
+
+    context = get_project_context(project["id"], topic["id"])
+
+    assert project["name"] == "alpha"
+    assert project["description"] == "demo project"
+    assert topic["name"] == "General"
+    assert saved["text"].startswith("Remember")
+    assert any("local-first" in entry["text"] for entry in context["entries"])
+    assert context["topic"]["name"] == "General"
